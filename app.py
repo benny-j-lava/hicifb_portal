@@ -7,7 +7,7 @@ from datetime import datetime
 CSV_TEAMS       = "https://docs.google.com/spreadsheets/d/e/2PACX-1vToS6-KCa5gBhrUPLevOIlcFlt4PFQkmnnC7tyCQDc3r145W3xB23ggq55NNF663qFdu4WIJ05LGHki/pub?gid=0&single=true&output=csv"
 CSV_WEEKS       = "https://docs.google.com/spreadsheets/d/e/2PACX-1vToS6-KCa5gBhrUPLevOIlcFlt4PFQkmnnC7tyCQDc3r145W3xB23ggq55NNF663qFdu4WIJ05LGHki/pub?gid=29563283&single=true&output=csv"
 CSV_CHALLENGES  = "https://docs.google.com/spreadsheets/d/e/2PACX-1vToS6-KCa5gBhrUPLevOIlcFlt4PFQkmnnC7tyCQDc3r145W3xB23ggq55NNF663qFdu4WIJ05LGHki/pub?gid=570391343&single=true&output=csv"
-LEAGUE_TITLE    = "🏈 HICIFB 2025 League Portal"
+LEAGUE_TITLE    = "🏈 Huck It Chuck It FOOTBALL 2025 League Portal"
 # ------------------------------------------------
 
 st.set_page_config(page_title="League Portal", layout="wide", initial_sidebar_state="collapsed")
@@ -184,16 +184,20 @@ if "winner_team_id" in hist.columns and "team_id" in teams.columns:
     except Exception:
         hist["team_name"] = None
 
-cols = [c for c in ["week","challenge_id","challenge_name","team_name","prize_amount","paid"] if c in hist.columns]
+# 👉 drop ID from view
+cols = [c for c in ["week","challenge_name","team_name","prize_amount","paid"] if c in hist.columns]
 hist_show = hist[cols].rename(columns={
-    "week":"Week","challenge_id":"ID","challenge_name":"Challenge",
-    "team_name":"Winner","prize_amount":"Prize","paid":"Paid"
-}).sort_values(["Week","Challenge","ID"])
+    "week":"Week",
+    "challenge_name":"Challenge",
+    "team_name":"Winner",
+    "prize_amount":"Prize",
+    "paid":"Paid"
+}).sort_values(["Week","Challenge"])
 
 if "Prize" in hist_show.columns:
     hist_show["Prize"] = hist_show["Prize"].apply(money)
 
-st.dataframe(hist_show, use_container_width=True, height=420)
+st.dataframe(hist_show, use_container_width=True, height=420, hide_index=True)
 
 st.markdown("---")
 
@@ -226,7 +230,12 @@ else:
     for c in ["Total_Won","Total_Paid"]:
         by_team[c] = by_team[c].apply(money)
 
-    st.dataframe(by_team[["team_name","owner","Total_Won","Total_Paid"]], use_container_width=True, height=420)
+    st.dataframe(
+        by_team[["team_name","owner","Total_Won","Total_Paid"]],
+        use_container_width=True,
+        height=420,
+        hide_index=True
+    )
 
     # season totals (raw numbers for accuracy)
     raw_tot_won  = float(awarded["prize_amount"].sum())
@@ -244,21 +253,26 @@ if "eliminated_week" not in teams.columns:
 else:
     alive = teams[teams["eliminated_week"].isna()].copy().sort_values("team_name")
     st.markdown(f"**Still Alive ({len(alive)})**")
-    st.dataframe(alive[[c for c in ["team_name","owner"] if c in alive.columns]], use_container_width=True, height=240)
+    st.dataframe(
+        alive[[c for c in ["team_name","owner"] if c in alive.columns]],
+        use_container_width=True, height=240, hide_index=True
+    )
 
     out = teams.dropna(subset=["eliminated_week"]).copy()
     if out.empty:
         st.caption("_No eliminations recorded yet._")
     else:
         out["eliminated_week"] = out["eliminated_week"].astype(int)
-        # hide future eliminations unless override
         if not show_future:
             out = out[out["eliminated_week"] <= MAX_WEEK]
         elim_cols = ["eliminated_week","team_name"]
         for c in ["eliminated_score","eliminated_note"]:
             if c in out.columns: elim_cols.append(c)
         st.markdown("**Eliminations by Week**")
-        st.dataframe(out.sort_values(["eliminated_week","team_name"])[elim_cols], use_container_width=True, height=320)
+        st.dataframe(
+            out.sort_values(["eliminated_week","team_name"])[elim_cols],
+            use_container_width=True, height=320, hide_index=True
+        )
 
 # ------------------ debug (optional) ------------------
 with st.expander("🔧 Debug (types)"):
