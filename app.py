@@ -7,7 +7,8 @@ from datetime import datetime
 CSV_TEAMS       = "https://docs.google.com/spreadsheets/d/e/2PACX-1vToS6-KCa5gBhrUPLevOIlcFlt4PFQkmnnC7tyCQDc3r145W3xB23ggq55NNF663qFdu4WIJ05LGHki/pub?gid=0&single=true&output=csv"
 CSV_WEEKS       = "https://docs.google.com/spreadsheets/d/e/2PACX-1vToS6-KCa5gBhrUPLevOIlcFlt4PFQkmnnC7tyCQDc3r145W3xB23ggq55NNF663qFdu4WIJ05LGHki/pub?gid=29563283&single=true&output=csv"
 CSV_CHALLENGES  = "https://docs.google.com/spreadsheets/d/e/2PACX-1vToS6-KCa5gBhrUPLevOIlcFlt4PFQkmnnC7tyCQDc3r145W3xB23ggq55NNF663qFdu4WIJ05LGHki/pub?gid=570391343&single=true&output=csv"
-LEAGUE_TITLE    = "🏈 Huck It Chuck It FOOTBALL 2025 League Portal"
+LEAGUE_TITLE    = "🏈 HICIFB 2025 League Portal"
+LEAGUE_FEE      = 100  # per-team buy-in used for Net earnings
 # ------------------------------------------------
 
 st.set_page_config(page_title="League Portal", layout="wide", initial_sidebar_state="collapsed")
@@ -86,7 +87,7 @@ def load():
         teams["eliminated_week"] = pd.to_numeric(teams["eliminated_week"], errors="coerce").astype("Int64")
 
     # numeric money & paid flag
-    if "prize_amount" in chal: chal["prize_amount"] = pd.to_numeric(chal["prize_amount"], errors="coerce").fillna(0)
+    if "prize_amount" in chal: chal["prize_amount"] = pd.to_numeric(chal["prize_amount"], errors="coerce").fillna(0.0)
     if "paid" in chal:         chal["paid"] = to_bool_loose(chal["paid"])
     else:                      chal["paid"] = False
 
@@ -142,7 +143,7 @@ if not wk_chal.empty and {"winner_team_id"}.issubset(wk_chal.columns) and "team_
 if wk_chal.empty:
     st.info("No challenges found for this week yet.")
 else:
-    # de-dupe within a week by challenge_id (or challenge_name if you prefer)
+    # de-dupe within a week by challenge_id (or challenge_name if desired)
     if "challenge_id" in wk_chal.columns:
         wk_chal["has_winner"] = wk_chal["winner_team_id"].notna()
         wk_chal = wk_chal.sort_values(["has_winner","paid","challenge_id"], ascending=[False, False, True]) \
@@ -173,7 +174,6 @@ st.markdown("---")
 st.subheader("📜 Challenge Winners History")
 
 hist = chal.copy()
-# hide future weeks unless override
 if "week" in hist.columns and not show_future:
     hist = hist[hist["week"].notna()]
     hist = hist[hist["week"] <= MAX_WEEK]
@@ -184,7 +184,7 @@ if "winner_team_id" in hist.columns and "team_id" in teams.columns:
     except Exception:
         hist["team_name"] = None
 
-# 👉 drop ID from view
+# drop ID from view
 cols = [c for c in ["week","challenge_name","team_name","prize_amount","paid"] if c in hist.columns]
 hist_show = hist[cols].rename(columns={
     "week":"Week",
@@ -192,7 +192,11 @@ hist_show = hist[cols].rename(columns={
     "team_name":"Winner",
     "prize_amount":"Prize",
     "paid":"Paid"
-}).sort_values(["Week","Challenge"])
+})
+
+# --- make "High Score" sort first within each week ---
+hist_show["__prio"] = (hist_show["Challenge"].astype(str).str.strip().str.lower() != "high score").astype(int)
+hist_show = hist_show.sort_values(["Week", "__prio", "Challenge"]).drop(columns="__prio")
 
 if "Prize" in hist_show.columns:
     hist_show["Prize"] = hist_show["Prize"].apply(money)
@@ -201,7 +205,7 @@ st.dataframe(hist_show, use_container_width=True, height=420, hide_index=True)
 
 st.markdown("---")
 
-# ------------------ payouts by team ------------------
+# ------------------ payouts by team (with Net) ------------------
 st.subheader("🏆 Payouts by Team")
 
 awarded = chal.dropna(subset=["winner_team_id"]).copy() if "winner_team_id" in chal else pd.DataFrame()
@@ -212,32 +216,42 @@ if not awarded.empty and "week" in awarded.columns and not show_future:
 if awarded.empty:
     st.info("No winners recorded yet.")
 else:
-    by_team = awarded.groupby("winner_team_id", as_index=False)["prize_amount"].sum() \
-                     .rename(columns={"winner_team_id":"team_id","prize_amount":"Total_Won"})
-
+    # numeric totals
+    totals_won = awarded.groupby("winner_team_id", as_index=False)["prize_amount"].sum() \
+                        .rename(columns={"winner_team_id":"team_id","prize_amount":"Total_Won"})
     if "paid" in awarded.columns:
-        paid_totals = awarded[awarded["paid"]].groupby("winner_team_id", as_index=False)["prize_amount"].sum() \
-                       .rename(columns={"winner_team_id":"team_id","prize_amount":"Total_Paid"})
-        by_team = by_team.merge(paid_totals, on="team_id", how="left")
-        by_team["Total_Paid"] = by_team["Total_Paid"].fillna(0)
+        totals_paid = awarded[awarded["paid"]].groupby("winner_team_id", as_index=False)["prize_amount"].sum() \
+                        .rename(columns={"winner_team_id":"team_id","prize_amount":"Total_Paid"})
     else:
-        by_team["Total_Paid"] = 0
+        totals_paid = pd.DataFrame({"team_id": [], "Total_Paid": []})
 
-    by_team = by_team.merge(teams[["team_id","team_name","owner"]], on="team_id", how="left") \
-                     .sort_values(["Total_Won","team_name"], ascending=[False, True])
+    by_team = totals_won.merge(totals_paid, on="team_id", how="left").fillna({"Total_Paid": 0.0})
+    by_team = by_team.merge(teams[["team_id","team_name","owner"]], on="team_id", how="left")
 
-    # pretty money
-    for c in ["Total_Won","Total_Paid"]:
-        by_team[c] = by_team[c].apply(money)
+    # league fee + nets
+    by_team["Fee"]          = float(LEAGUE_FEE)
+    by_team["Net_Awarded"]  = by_team["Total_Won"]  - by_team["Fee"]
+    by_team["Net_Paid"]     = by_team["Total_Paid"] - by_team["Fee"]
 
-    st.dataframe(
-        by_team[["team_name","owner","Total_Won","Total_Paid"]],
-        use_container_width=True,
-        height=420,
-        hide_index=True
-    )
+    by_team = by_team.sort_values(["Total_Won","team_name"], ascending=[False, True])
 
-    # season totals (raw numbers for accuracy)
+    # toggle which net to color/emphasize
+    use_paid_for_net = st.toggle("Calculate Net using Paid (vs Awarded)", value=True)
+    net_col = "Net_Paid" if use_paid_for_net else "Net_Awarded"
+
+    disp = by_team[["team_name","owner","Total_Won","Total_Paid","Fee","Net_Awarded","Net_Paid"]].copy()
+
+    # styling
+    def color_net(s):
+        return ["color: green;" if v > 0 else "color: red;" if v < 0 else "" for v in s]
+
+    styled = (disp.style
+              .format({c: money for c in ["Total_Won","Total_Paid","Fee","Net_Awarded","Net_Paid"]})
+              .apply(color_net, subset=[net_col]))
+
+    st.dataframe(styled, use_container_width=True, height=460, hide_index=True)
+
+    # season totals (raw)
     raw_tot_won  = float(awarded["prize_amount"].sum())
     raw_tot_paid = float(awarded.loc[awarded.get("paid", False), "prize_amount"].sum()) if "paid" in awarded.columns else 0.0
     st.markdown("**Season Totals**")
