@@ -6,81 +6,252 @@ from datetime import datetime, date
 CSV_TEAMS       = "https://docs.google.com/spreadsheets/d/e/2PACX-1vToS6-KCa5gBhrUPLevOIlcFlt4PFQkmnnC7tyCQDc3r145W3xB23ggq55NNF663qFdu4WIJ05LGHki/pub?gid=0&single=true&output=csv"
 CSV_WEEKS       = "https://docs.google.com/spreadsheets/d/e/2PACX-1vToS6-KCa5gBhrUPLevOIlcFlt4PFQkmnnC7tyCQDc3r145W3xB23ggq55NNF663qFdu4WIJ05LGHki/pub?gid=29563283&single=true&output=csv"
 CSV_CHALLENGES  = "https://docs.google.com/spreadsheets/d/e/2PACX-1vToS6-KCa5gBhrUPLevOIlcFlt4PFQkmnnC7tyCQDc3r145W3xB23ggq55NNF663qFdu4WIJ05LGHki/pub?gid=570391343&single=true&output=csv"
+LEAGUE_TITLE    = "🏈 HICIFB 2025 League Portal"
 # -----------------------------------------------------------
 
-st.set_page_config(page_title="Fantasy League Portal", layout="wide")
+st.set_page_config(page_title="League Portal", layout="wide", initial_sidebar_state="collapsed")
 
+# ------------------ Helpers ------------------
+def norm_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    return df
+
+def to_int_nullable(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").astype("Int64")
+
+def to_bool_loose(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.strip().str.lower().isin(["y", "yes", "true", "1"])
+
+def parse_date_col(df: pd.DataFrame, colname: str) -> None:
+    if colname in df.columns:
+        df[colname] = pd.to_datetime(df[colname], errors="coerce")  # -> datetime64[ns]
+
+def ensure_week_columns(weeks: pd.DataFrame) -> pd.DataFrame:
+    # Map common alternate headers to start_date / end_date if needed
+    alt_map = {
+        "start": "start_date", "startdate": "start_date",
+        "end": "end_date", "enddate": "end_date",
+    }
+    for src, dst in alt_map.items():
+        if src in weeks.columns and dst not in weeks.columns:
+            weeks[dst] = weeks[src]
+    return weeks
+
+def get_current_week(weeks: pd.DataFrame) -> int | None:
+    if weeks.empty or "start_date" not in weeks or "end_date" not in weeks or "week" not in weeks:
+        return None
+    # today as Timestamp for clean comparison with datetime64 series
+    today_ts = pd.Timestamp(datetime.now().date())
+    mask = (weeks["start_date"] <= today_ts) & (today_ts <= weeks["end_date"])
+    hit = weeks[mask]
+    if not hit.empty and pd.notna(hit.iloc[0]["week"]):
+        return int(hit.iloc[0]["week"])
+    # fallback: latest started week
+    past = weeks[(weeks["start_date"] <= today_ts) & weeks["week"].notna()].sort_values("start_date")
+    if not past.empty:
+        return int(past.iloc[-1]["week"])
+    # final fallback: earliest week available
+    wk = weeks.loc[weeks["week"].notna(), "week"]
+    return int(wk.min()) if not wk.empty else None
+
+def fmt_money(x):
+    try:
+        return f"${float(x):,.0f}"
+    except Exception:
+        return x
+
+# ------------------ Data Load ------------------
 @st.cache_data(ttl=300)
-def load():
-    teams = pd.read_csv(CSV_TEAMS)
-    weeks = pd.read_csv(CSV_WEEKS)
-    chal  = pd.read_csv(CSV_CHALLENGES)
+def load_data():
+    teams = norm_cols(pd.read_csv(CSV_TEAMS))
+    weeks = norm_cols(pd.read_csv(CSV_WEEKS))
+    chal  = norm_cols(pd.read_csv(CSV_CHALLENGES))
 
-    # normalize
-    for df in (teams, weeks, chal):
-        df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    # Parse weeks dates robustly
+    weeks = ensure_week_columns(weeks)
+    parse_date_col(weeks, "start_date")
+    parse_date_col(weeks, "end_date")
+    if "week" in weeks:
+        weeks["week"] = to_int_nullable(weeks["week"])
 
-    # parse weeks
-    if "start_date" in weeks: weeks["start_date"] = pd.to_datetime(weeks["start_date"])
-    if "end_date" in weeks: weeks["end_date"] = pd.to_datetime(weeks["end_date"])
+    # IDs & numeric fields
+    if "team_id" in teams:
+        teams["team_id"] = to_int_nullable(teams["team_id"])
+    if "eliminated_week" in teams:
+        teams["eliminated_week"] = to_int_nullable(teams["eliminated_week"])
 
-    chal["prize_amount"] = pd.to_numeric(chal["prize_amount"], errors="coerce").fillna(0)
-    chal["winner_team_id"] = pd.to_numeric(chal.get("winner_team_id", pd.Series([])), errors="coerce")
+    if "winner_team_id" in chal:
+        chal["winner_team_id"] = to_int_nullable(chal["winner_team_id"])
+    if "week" in chal:
+        chal["week"] = to_int_nullable(chal["week"])
+    if "prize_amount" in chal:
+        chal["prize_amount"] = pd.to_numeric(chal["prize_amount"], errors="coerce").fillna(0)
+
+    # Paid flag (optional)
+    if "paid" in chal:
+        chal["paid"] = to_bool_loose(chal["paid"])
+    else:
+        chal["paid"] = False
 
     return teams, weeks, chal
 
-teams, weeks, chal = load()
+try:
+    teams, weeks, chal = load_data()
+except Exception as e:
+    st.error("Failed to load data. Check your CSV URLs and that each tab is published as CSV.")
+    st.exception(e)
+    st.stop()
 
-# -------- Current week --------
-today = datetime.now().date()
-wk_row = weeks[(weeks["start_date"] <= today) & (today <= weeks["end_date"])]
-wk = int(wk_row.iloc[0]["week"]) if not wk_row.empty else int(chal["week"].max())
+# Compute current week with fallbacks
+wk_current = get_current_week(weeks)
+if wk_current is None:
+    # fallback to max week in challenges if weeks parsing didn’t work
+    wk_current = int(chal["week"].dropna().max()) if "week" in chal.columns and not chal.empty else 1
 
-st.title("🏈 HICIFB 2025 League Portal")
-st.caption(f"Week {wk} — {weeks.loc[weeks['week']==wk,'start_date'].iloc[0].date()} to {weeks.loc[weeks['week']==wk,'end_date'].iloc[0].date()}")
+# ------------------ Header ------------------
+st.title(LEAGUE_TITLE)
 
-# ===== Section 1: This Week's Challenges =====
+# Show date range if available
+date_line = ""
+if not weeks.empty and {"week", "start_date", "end_date"}.issubset(weeks.columns):
+    row = weeks.loc[weeks["week"] == wk_current]
+    if not row.empty:
+        sd = row.iloc[0]["start_date"]
+        ed = row.iloc[0]["end_date"]
+        if pd.notna(sd) and pd.notna(ed):
+            date_line = f" — {sd.date()} to {ed.date()}"
+st.caption(f"Week {wk_current}{date_line}")
+
+# ------------------ Section 1: This Week’s Challenges ------------------
 st.subheader("📌 This Week’s Challenges")
-wk_chal = chal[chal["week"] == wk].copy()
 
-if "winner_team_id" in wk_chal.columns:
-    wk_chal = wk_chal.merge(teams[["team_id","team_name"]], left_on="winner_team_id", right_on="team_id", how="left")
+wk_chal = chal[chal["week"] == wk_current].copy() if "week" in chal.columns else chal.copy()
+# Try to join winner name
+if not wk_chal.empty and "winner_team_id" in wk_chal.columns and "team_id" in teams.columns:
+    try:
+        wk_chal = wk_chal.merge(teams[["team_id", "team_name"]], left_on="winner_team_id", right_on="team_id", how="left")
+    except Exception:
+        wk_chal["team_name"] = None
 
-for _, row in wk_chal.iterrows():
-    with st.container():
-        st.markdown(f"**{row['challenge_name']}** — {row['description']}")
-        st.write(f"💰 Prize: ${row['prize_amount']}")
-        if pd.notna(row.get("team_name")):
-            st.write(f"🏆 Winner: {row['team_name']} ({row.get('winner_details','')})")
-        if row.get("paid", False):
-            st.write("✅ Paid")
+if wk_chal.empty:
+    st.info("No challenges found for this week yet.")
+else:
+    # Render as compact cards
+    for _, r in wk_chal.sort_values("challenge_name").iterrows():
+        with st.container():
+            left, mid, right = st.columns([3, 1, 2])
+            with left:
+                st.markdown(f"**{r.get('challenge_name','Challenge')}**")
+                if pd.notna(r.get("description")):
+                    st.caption(r["description"])
+            with mid:
+                st.metric("Prize", fmt_money(r.get("prize_amount", 0)))
+            with right:
+                winner = r.get("team_name")
+                details = r.get("winner_details", "")
+                paid = bool(r.get("paid", False))
+                if pd.notna(winner):
+                    st.write(f"🏆 **{winner}**")
+                    if isinstance(details, str) and details.strip():
+                        st.caption(details)
+                if paid:
+                    st.success("Paid")
 
 st.markdown("---")
 
-# ===== Section 2: Challenge History =====
+# ------------------ Section 2: Challenge Winners History ------------------
 st.subheader("📜 Challenge Winners History")
 
-chal_hist = chal.copy()
-if "winner_team_id" in chal_hist.columns:
-    chal_hist = chal_hist.merge(teams[["team_id","team_name"]], left_on="winner_team_id", right_on="team_id", how="left")
+hist = chal.copy()
+if "winner_team_id" in hist.columns and "team_id" in teams.columns:
+    try:
+        hist = hist.merge(teams[["team_id", "team_name"]], left_on="winner_team_id", right_on="team_id", how="left")
+    except Exception:
+        hist["team_name"] = None
 
-cols = [c for c in ["week","challenge_name","team_name","prize_amount","paid"] if c in chal_hist.columns]
-chal_hist = chal_hist[cols].rename(columns={
-    "week":"Week", "challenge_name":"Challenge", "team_name":"Winner",
-    "prize_amount":"Prize", "paid":"Paid"
-}).sort_values(["Week","Challenge"])
+cols = [c for c in ["week", "challenge_name", "team_name", "prize_amount", "paid"] if c in hist.columns]
+hist_show = hist[cols].rename(columns={
+    "week": "Week",
+    "challenge_name": "Challenge",
+    "team_name": "Winner",
+    "prize_amount": "Prize",
+    "paid": "Paid",
+}).sort_values(["Week", "Challenge"])
 
-st.dataframe(chal_hist, use_container_width=True, height=400)
+# Pretty money
+if "Prize" in hist_show.columns:
+    hist_show["Prize"] = hist_show["Prize"].apply(fmt_money)
+
+st.dataframe(hist_show, use_container_width=True, height=420)
 
 st.markdown("---")
 
-# ===== Section 3: Team Standings =====
+# ------------------ Section 3: Payouts by Team (Totals) ------------------
 st.subheader("🏆 Payouts by Team")
 
-awarded = chal.dropna(subset=["winner_team_id"]).copy()
-by_team = awarded.groupby("winner_team_id", as_index=False)["prize_amount"].sum()
-by_team = by_team.rename(columns={"winner_team_id":"team_id","prize_amount":"Total_Won"})
-by_team = by_team.merge(teams[["team_id","team_name","owner"]], on="team_id", how="left")
-by_team = by_team.sort_values("Total_Won", ascending=False)
+awarded = chal.dropna(subset=["winner_team_id"]).copy() if "winner_team_id" in chal else pd.DataFrame()
+if awarded.empty:
+    st.info("No winners recorded yet.")
+else:
+    awarded["winner_team_id"] = to_int_nullable(awarded["winner_team_id"])
+    by_team = awarded.groupby("winner_team_id", as_index=False)["prize_amount"].sum() \
+        .rename(columns={"winner_team_id": "team_id", "prize_amount": "Total_Won"})
 
-st.dataframe(by_team[["team_name","owner","Total_Won"]], use_container_width=True, height=400)
+    # Paid totals (optional)
+    if "paid" in awarded.columns:
+        paid_totals = awarded[awarded["paid"]].groupby("winner_team_id", as_index=False)["prize_amount"].sum() \
+            .rename(columns={"winner_team_id": "team_id", "prize_amount": "Total_Paid"})
+        by_team = by_team.merge(paid_totals, on="team_id", how="left")
+        by_team["Total_Paid"] = by_team["Total_Paid"].fillna(0)
+    else:
+        by_team["Total_Paid"] = 0
+
+    by_team = by_team.merge(teams[["team_id", "team_name", "owner"]], on="team_id", how="left") \
+                     .sort_values(["Total_Won", "team_name"], ascending=[False, True])
+
+    show_cols = ["team_name", "owner", "Total_Won", "Total_Paid"]
+    # Pretty money
+    for mcol in ["Total_Won", "Total_Paid"]:
+        if mcol in by_team.columns:
+            by_team[mcol] = by_team[mcol].apply(fmt_money)
+
+    st.dataframe(by_team[show_cols], use_container_width=True, height=420)
+
+    # Season totals
+    raw_tot_won = awarded["prize_amount"].sum()
+    raw_tot_paid = awarded.loc[awarded.get("paid", False), "prize_amount"].sum() if "paid" in awarded.columns else 0
+    st.markdown("**Season Totals**")
+    st.write(f"- **Total Awarded:** {fmt_money(raw_tot_won)}")
+    st.write(f"- **Total Paid:** {fmt_money(raw_tot_paid)}")
+
+st.markdown("---")
+
+# ------------------ Survivor (from Teams.eliminated_week) ------------------
+st.subheader("🪓 Survivor (Guillotine)")
+
+if "eliminated_week" not in teams.columns:
+    st.info("Add an 'eliminated_week' column to Teams (blank = still alive). Optional: eliminated_score, eliminated_note.")
+else:
+    alive = teams[teams["eliminated_week"].isna()].copy().sort_values("team_name")
+    st.markdown(f"**Still Alive ({len(alive)})**")
+    st.dataframe(alive[[c for c in ["team_name", "owner"] if c in alive.columns]],
+                 use_container_width=True, height=240)
+
+    out = teams.dropna(subset=["eliminated_week"]).copy()
+    if out.empty:
+        st.caption("_No eliminations recorded yet._")
+    else:
+        out["eliminated_week"] = out["eliminated_week"].astype(int)
+        elim_cols = ["eliminated_week", "team_name"]
+        for c in ["eliminated_score", "eliminated_note"]:
+            if c in out.columns:
+                elim_cols.append(c)
+        st.markdown("**Eliminations by Week**")
+        st.dataframe(out.sort_values(["eliminated_week", "team_name"])[elim_cols],
+                     use_container_width=True, height=320)
+
+# ------------------ Optional: tiny debug toggle ------------------
+with st.expander("🔧 Debug (types)"):
+    st.write("Weeks dtypes:", dict(weeks.dtypes))
+    st.write("Challenges dtypes:", dict(chal.dtypes))
+    st.write("Teams dtypes:", dict(teams.dtypes))
