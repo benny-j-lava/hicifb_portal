@@ -7,8 +7,15 @@ from datetime import datetime
 CSV_TEAMS       = "https://docs.google.com/spreadsheets/d/e/2PACX-1vToS6-KCa5gBhrUPLevOIlcFlt4PFQkmnnC7tyCQDc3r145W3xB23ggq55NNF663qFdu4WIJ05LGHki/pub?gid=0&single=true&output=csv"
 CSV_WEEKS       = "https://docs.google.com/spreadsheets/d/e/2PACX-1vToS6-KCa5gBhrUPLevOIlcFlt4PFQkmnnC7tyCQDc3r145W3xB23ggq55NNF663qFdu4WIJ05LGHki/pub?gid=29563283&single=true&output=csv"
 CSV_CHALLENGES  = "https://docs.google.com/spreadsheets/d/e/2PACX-1vToS6-KCa5gBhrUPLevOIlcFlt4PFQkmnnC7tyCQDc3r145W3xB23ggq55NNF663qFdu4WIJ05LGHki/pub?gid=570391343&single=true&output=csv"
-LEAGUE_TITLE    = "🏈 HICIFB 2025 League Portal"
-LEAGUE_FEE      = 100  # per-team buy-in used for Net earnings
+CSV_TOLLS       = "https://docs.google.com/spreadsheets/d/e/2PACX-1vToS6-KCa5gBhrUPLevOIlcFlt4PFQkmnnC7tyCQDc3r145W3xB23ggq55NNF663qFdu4WIJ05LGHki/pub?gid=332831073&single=true&output=csv"
+
+LEAGUE_TITLE    = "🏈 Huck It Chuck It Football 2025 League Portal"
+LEAGUE_FEE      = 100.0  # per-team buy-in (used in Net; not shown as a column)
+TOLL_BASE       = 5.0    # first Talbot Toll offense = $5, then doubles per offense
+
+# External resources (shown as nice text links)
+URL_YAHOO       = "https://football.fantasysports.yahoo.com/f1/694605"
+URL_RULES       = "https://drive.google.com/file/d/14i2QpHLCuM6WnytHGJzrTt5K6FFf4PLL/view?usp=drive_link"
 # ------------------------------------------------
 
 st.set_page_config(page_title="League Portal", layout="wide", initial_sidebar_state="collapsed")
@@ -23,7 +30,6 @@ def parse_date(df: pd.DataFrame, col: str):
         df[col] = pd.to_datetime(df[col], errors="coerce")
 
 def ensure_week_headers(weeks: pd.DataFrame) -> pd.DataFrame:
-    # map common alternates -> start_date/end_date
     alt = {"start": "start_date", "startdate": "start_date", "end": "end_date", "enddate": "end_date"}
     for src, dst in alt.items():
         if src in weeks.columns and dst not in weeks.columns:
@@ -31,7 +37,6 @@ def ensure_week_headers(weeks: pd.DataFrame) -> pd.DataFrame:
     return weeks
 
 def norm_id_series(s: pd.Series) -> pd.Series:
-    # keep IDs like "t9" as strings; blank -> NaN
     out = s.astype(str).str.strip().str.lower()
     return out.mask(out.isin(["", "nan", "none"]))
 
@@ -53,9 +58,30 @@ def current_week_from_calendar(weeks: pd.DataFrame) -> int | None:
 
 def money(x):
     try:
-        return f"${float(x):,.0f}"
+        val = float(x)
+        if pd.isna(val):
+            val = 0.0
+        return f"${val:,.0f}"
     except Exception:
         return x
+
+def table_height(n_rows: int, row_px: int = 34, header_px: int = 38, pad_px: int = 8, max_px: int = 900) -> int:
+    return min(max_px, header_px + max(0, n_rows) * row_px + pad_px)
+
+def friendly_date(dt: pd.Timestamp | datetime | None) -> str:
+    if pd.isna(dt) or dt is None:
+        return ""
+    if isinstance(dt, pd.Timestamp):
+        dt = dt.to_pydatetime()
+    return f"{dt.strftime('%A')}, {dt.strftime('%B')} {dt.day}"
+
+# Talbot Tolls: base* (2^(N+M) - 2^N)
+def compute_toll_row(total_prior_offenses: float, misses_this_week: float, base: float) -> float:
+    if pd.isna(misses_this_week) or misses_this_week <= 0:
+        return 0.0
+    N = float(total_prior_offenses or 0)
+    M = float(misses_this_week or 0)
+    return base * (2.0 ** (N + M) - 2.0 ** N)
 
 # ------------------ data load ------------------
 @st.cache_data(ttl=300)
@@ -64,37 +90,50 @@ def load():
     weeks = norm_cols(pd.read_csv(CSV_WEEKS))
     chal  = norm_cols(pd.read_csv(CSV_CHALLENGES))
 
-    # handle "prize amount" -> prize_amount
+    tolls = pd.DataFrame()
+    if CSV_TOLLS:
+        try:
+            tolls = norm_cols(pd.read_csv(CSV_TOLLS))
+        except Exception:
+            tolls = pd.DataFrame()
+
     if "prize amount" in chal.columns and "prize_amount" not in chal.columns:
         chal.rename(columns={"prize amount": "prize_amount"}, inplace=True)
 
-    # parse dates / weeks
     weeks = ensure_week_headers(weeks)
-    parse_date(weeks, "start_date")
-    parse_date(weeks, "end_date")
+    parse_date(weeks, "start_date"); parse_date(weeks, "end_date")
     if "week" in weeks: weeks["week"] = pd.to_numeric(weeks["week"], errors="coerce").astype("Int64")
     if "week" in chal:  chal["week"]  = pd.to_numeric(chal["week"],  errors="coerce").astype("Int64")
 
-    # IDs as strings (t1, t2, …)
     if "team_id" in teams:       teams["team_id"] = norm_id_series(teams["team_id"])
     if "winner_team_id" in chal: chal["winner_team_id"] = norm_id_series(chal["winner_team_id"])
 
-    # survivor column mapping from your Teams sheet
-    # your columns: team_id, team_name, owner, notes, survivor_eliminated_week, still_alive
     if "survivor_eliminated_week" in teams.columns and "eliminated_week" not in teams.columns:
         teams["eliminated_week"] = pd.to_numeric(teams["survivor_eliminated_week"], errors="coerce").astype("Int64")
     elif "eliminated_week" in teams.columns:
         teams["eliminated_week"] = pd.to_numeric(teams["eliminated_week"], errors="coerce").astype("Int64")
 
-    # numeric money & paid flag
     if "prize_amount" in chal: chal["prize_amount"] = pd.to_numeric(chal["prize_amount"], errors="coerce").fillna(0.0)
     if "paid" in chal:         chal["paid"] = to_bool_loose(chal["paid"])
     else:                      chal["paid"] = False
 
-    return teams, weeks, chal
+    if not tolls.empty:
+        if "missing_starters" not in tolls.columns:
+            for alt in ["players_missing", "incomplete_starters", "missing"]:
+                if alt in tolls.columns:
+                    tolls.rename(columns={alt: "missing_starters"}, inplace=True)
+                    break
+        if "week" in tolls:    tolls["week"] = pd.to_numeric(tolls["week"], errors="coerce").astype("Int64")
+        if "team_id" in tolls: tolls["team_id"] = norm_id_series(tolls["team_id"])
+        if "missing_starters" in tolls:
+            tolls["missing_starters"] = pd.to_numeric(tolls["missing_starters"], errors="coerce").fillna(0).astype(int)
+        else:
+            tolls["missing_starters"] = 0
+
+    return teams, weeks, chal, tolls
 
 try:
-    teams, weeks, chal = load()
+    teams, weeks, chal, tolls = load()
 except Exception as e:
     st.error("Failed to load data. Check your CSV links and that each tab is published as CSV.")
     st.exception(e)
@@ -107,47 +146,56 @@ if wk_current is None:
 # ------------------ header ------------------
 st.title(LEAGUE_TITLE)
 
-date_line = ""
+# Friendly subheader for current week
+sd = ed = None
 if not weeks.empty and {"week","start_date","end_date"}.issubset(weeks.columns):
     row = weeks.loc[weeks["week"] == wk_current]
     if not row.empty:
         sd, ed = row.iloc[0]["start_date"], row.iloc[0]["end_date"]
-        if pd.notna(sd) and pd.notna(ed):
-            date_line = f" — {sd.date()} to {ed.date()}"
-st.caption(f"Week {wk_current}{date_line}")
 
-# toggle to include future weeks
-show_future = st.checkbox("Include future weeks", value=False)
+if pd.notna(sd) and pd.notna(ed):
+    st.markdown(f"#### Week {wk_current} — {friendly_date(sd)} to {friendly_date(ed)}")
+else:
+    st.markdown(f"#### Week {wk_current}")
+
+# 📚 Resources (buttons)
+# Buttons (comment out if you prefer the bullet links)
+st.link_button("Open Yahoo League", URL_YAHOO)
+st.link_button("Open League Rules (PDF)", URL_RULES)
+
+
+st.markdown("---")
+
+# Current-week anchor & picker range
 MAX_WEEK = int(wk_current or 1)
+WEEK_MAX_AVAILABLE = int(max([
+    (weeks["week"].dropna().max() if "week" in weeks else 0) or 0,
+    (chal["week"].dropna().max() if "week" in chal else 0) or 0,
+    MAX_WEEK
+]))
 
 # ------------------ this week ------------------
 st.subheader("📌 This Week’s Challenges")
-
-wk = st.number_input(
-    "Week",
-    min_value=1,
-    max_value=(999 if show_future else MAX_WEEK),
-    value=min(int(wk_current or 1), MAX_WEEK),
-    step=1,
-)
-
+wk = st.number_input("Week", min_value=1, max_value=WEEK_MAX_AVAILABLE,
+                     value=min(int(wk_current or 1), WEEK_MAX_AVAILABLE), step=1)
 wk_chal = chal[chal["week"] == wk].copy() if "week" in chal.columns else chal.copy()
 
-# join winner names
+# join winner names/owners
 if not wk_chal.empty and {"winner_team_id"}.issubset(wk_chal.columns) and "team_id" in teams.columns:
     try:
-        wk_chal = wk_chal.merge(teams[["team_id","team_name"]], left_on="winner_team_id", right_on="team_id", how="left")
+        wk_chal = wk_chal.merge(teams[["team_id","team_name","owner"]],
+                                left_on="winner_team_id", right_on="team_id", how="left")
     except Exception:
         wk_chal["team_name"] = None
+        wk_chal["owner"] = None
 
 if wk_chal.empty:
     st.info("No challenges found for this week yet.")
 else:
-    # de-dupe within a week by challenge_id (or challenge_name if desired)
     if "challenge_id" in wk_chal.columns:
         wk_chal["has_winner"] = wk_chal["winner_team_id"].notna()
-        wk_chal = wk_chal.sort_values(["has_winner","paid","challenge_id"], ascending=[False, False, True]) \
-                         .drop_duplicates(subset=["challenge_id"], keep="first")
+        wk_chal = (wk_chal.sort_values(["has_winner","paid","challenge_id"], ascending=[False, False, True])
+                           .drop_duplicates(subset=["challenge_id"], keep="first"))
     for _, r in wk_chal.sort_values("challenge_name").iterrows():
         with st.container():
             left, mid, right = st.columns([3,1,2])
@@ -159,10 +207,12 @@ else:
             with mid:
                 st.metric("Prize", money(r.get("prize_amount", 0)))
             with right:
-                winner = r.get("team_name")
-                details = r.get("winner_details", "")
+                winner = r.get("team_name"); details = r.get("winner_details", "")
+                owner  = r.get("owner")
                 if isinstance(winner, str) and winner.strip():
                     st.write(f"🏆 **{winner}**")
+                    if isinstance(owner, str) and owner.strip():
+                        st.caption(f"Owner: {owner}")
                     if isinstance(details, str) and details.strip():
                         st.caption(details)
                 if bool(r.get("paid", False)):
@@ -172,91 +222,147 @@ st.markdown("---")
 
 # ------------------ history ------------------
 st.subheader("📜 Challenge Winners History")
-
 hist = chal.copy()
-if "week" in hist.columns and not show_future:
+if "week" in hist.columns:
     hist = hist[hist["week"].notna()]
     hist = hist[hist["week"] <= MAX_WEEK]
-
+if "winner_team_id" in hist.columns:
+    hist = hist.dropna(subset=["winner_team_id"])
 if "winner_team_id" in hist.columns and "team_id" in teams.columns:
     try:
-        hist = hist.merge(teams[["team_id","team_name"]], left_on="winner_team_id", right_on="team_id", how="left")
+        hist = hist.merge(teams[["team_id","team_name","owner"]],
+                          left_on="winner_team_id", right_on="team_id", how="left")
     except Exception:
         hist["team_name"] = None
+        hist["owner"] = None
 
-# drop ID from view
-cols = [c for c in ["week","challenge_name","team_name","prize_amount","paid"] if c in hist.columns]
+cols = [c for c in ["week","challenge_name","team_name","owner","winner_details","prize_amount","paid"] if c in hist.columns]
 hist_show = hist[cols].rename(columns={
     "week":"Week",
     "challenge_name":"Challenge",
     "team_name":"Winner",
+    "owner":"Owner",
+    "winner_details":"Details",
     "prize_amount":"Prize",
     "paid":"Paid"
 })
-
-# --- make "High Score" sort first within each week ---
+# High Score first within each week
 hist_show["__prio"] = (hist_show["Challenge"].astype(str).str.strip().str.lower() != "high score").astype(int)
 hist_show = hist_show.sort_values(["Week", "__prio", "Challenge"]).drop(columns="__prio")
-
 if "Prize" in hist_show.columns:
     hist_show["Prize"] = hist_show["Prize"].apply(money)
 
-st.dataframe(hist_show, use_container_width=True, height=420, hide_index=True)
+st.dataframe(hist_show, use_container_width=True, hide_index=True, height=table_height(len(hist_show)))
 
 st.markdown("---")
 
-# ------------------ payouts by team (with Net) ------------------
-st.subheader("🏆 Payouts by Team")
+# ------------------ Talbot Tolls ------------------
+st.subheader("🚧 Talbot Tolls")
+if CSV_TOLLS and not tolls.empty:
+    tt = tolls.copy()
+    if "week" in tt.columns:
+        tt = tt[tt["week"].notna()]
+        tt = tt[tt["week"] <= MAX_WEEK]
+    tt = tt.merge(teams[["team_id","team_name","owner"]], on="team_id", how="left")
+    tt = tt.sort_values(["team_id", "week"]).reset_index(drop=True)
 
+    # prior offenses per team BEFORE this row (fix: no cross-team bleed)
+    cum = tt.groupby("team_id")["missing_starters"].cumsum()
+    tt["prior_offenses"] = (cum - tt["missing_starters"]).clip(lower=0)
+
+    # per-row penalty and cumulative total
+    tt["penalty"] = tt.apply(
+        lambda r: compute_toll_row(r["prior_offenses"], r["missing_starters"], TOLL_BASE),
+        axis=1
+    ).fillna(0.0)
+    tt["cumulative_tolls"] = tt.groupby("team_id")["penalty"].cumsum().fillna(0.0)
+
+    show_tt = tt.rename(columns={
+        "week":"Week", "team_name":"Team", "owner":"Owner", "missing_starters":"Missing Starters",
+        "penalty":"Penalty", "cumulative_tolls":"Cumulative Tolls"
+    })[["Week","Team","Owner","Missing Starters","Penalty","Cumulative Tolls"]]
+    for c in ["Penalty","Cumulative Tolls"]:
+        show_tt[c] = show_tt[c].fillna(0).apply(money)
+
+    st.dataframe(show_tt, use_container_width=True, hide_index=True, height=table_height(len(show_tt)))
+    st.caption(
+        f"Rule: per missing starter offense, penalty doubles: "
+        f"{money(TOLL_BASE)}, {money(TOLL_BASE*2)}, {money(TOLL_BASE*4)}, … (cumulative per team)."
+    )
+else:
+    st.info("Add a **Tolls** tab to your Google Sheet and publish its CSV as `CSV_TOLLS`.\nColumns: `week, team_id, missing_starters` (or `players_missing`).")
+
+st.markdown("---")
+
+# ------------------ payouts by team (ALL teams; Net = Won − Fee − Tolls) ------------------
+st.subheader("🏆 Payouts by Team")
 awarded = chal.dropna(subset=["winner_team_id"]).copy() if "winner_team_id" in chal else pd.DataFrame()
-if not awarded.empty and "week" in awarded.columns and not show_future:
+if not awarded.empty and "week" in awarded.columns:
     awarded = awarded[awarded["week"].notna()]
     awarded = awarded[awarded["week"] <= MAX_WEEK]
 
-if awarded.empty:
-    st.info("No winners recorded yet.")
-else:
-    # numeric totals
+if not awarded.empty:
     totals_won = awarded.groupby("winner_team_id", as_index=False)["prize_amount"].sum() \
-                        .rename(columns={"winner_team_id":"team_id","prize_amount":"Total_Won"})
+                        .rename(columns={"winner_team_id":"team_id","prize_amount":"Total Won"})
     if "paid" in awarded.columns:
         totals_paid = awarded[awarded["paid"]].groupby("winner_team_id", as_index=False)["prize_amount"].sum() \
-                        .rename(columns={"winner_team_id":"team_id","prize_amount":"Total_Paid"})
+                        .rename(columns={"winner_team_id":"team_id","prize_amount":"Total Paid"})
     else:
-        totals_paid = pd.DataFrame({"team_id": [], "Total_Paid": []})
+        totals_paid = pd.DataFrame({"team_id": [], "Total Paid": []})
+else:
+    totals_won = pd.DataFrame({"team_id": [], "Total Won": []})
+    totals_paid = pd.DataFrame({"team_id": [], "Total Paid": []})
 
-    by_team = totals_won.merge(totals_paid, on="team_id", how="left").fillna({"Total_Paid": 0.0})
-    by_team = by_team.merge(teams[["team_id","team_name","owner"]], on="team_id", how="left")
+# Tolls totals with the same fix (no cross-team bleed)
+if CSV_TOLLS and not tolls.empty:
+    tt2 = tolls.copy()
+    if "week" in tt2.columns:
+        tt2 = tt2[tt2["week"].notna()]
+        tt2 = tt2[tt2["week"] <= MAX_WEEK]
+    tt2 = tt2.sort_values(["team_id","week"]).reset_index(drop=True)
 
-    # league fee + nets
-    by_team["Fee"]          = float(LEAGUE_FEE)
-    by_team["Net_Awarded"]  = by_team["Total_Won"]  - by_team["Fee"]
-    by_team["Net_Paid"]     = by_team["Total_Paid"] - by_team["Fee"]
+    cum2 = tt2.groupby("team_id")["missing_starters"].cumsum()
+    tt2["prior_offenses"] = (cum2 - tt2["missing_starters"]).clip(lower=0)
 
-    by_team = by_team.sort_values(["Total_Won","team_name"], ascending=[False, True])
+    tt2["penalty"] = tt2.apply(
+        lambda r: compute_toll_row(r["prior_offenses"], r["missing_starters"], TOLL_BASE),
+        axis=1
+    ).fillna(0.0)
+    toll_totals = tt2.groupby("team_id", as_index=False)["penalty"].sum().rename(columns={"penalty":"Tolls"})
+else:
+    toll_totals = pd.DataFrame({"team_id": [], "Tolls": []})
 
-    # toggle which net to color/emphasize
-    use_paid_for_net = st.toggle("Calculate Net using Paid (vs Awarded)", value=True)
-    net_col = "Net_Paid" if use_paid_for_net else "Net_Awarded"
+# Start from ALL teams so zero-winners still show
+base = teams[["team_id","team_name","owner"]].copy().rename(columns={"team_name":"Team","owner":"Owner"})
+by_team = (base
+    .merge(totals_won, on="team_id", how="left")
+    .merge(totals_paid, on="team_id", how="left")
+    .merge(toll_totals, on="team_id", how="left")
+)
+for c in ["Total Won", "Total Paid", "Tolls"]:
+    if c not in by_team.columns: by_team[c] = 0.0
+by_team[["Total Won","Total Paid","Tolls"]] = by_team[["Total Won","Total Paid","Tolls"]].fillna(0.0)
+by_team["Net"] = by_team["Total Won"] - LEAGUE_FEE - by_team["Tolls"]
 
-    disp = by_team[["team_name","owner","Total_Won","Total_Paid","Fee","Net_Awarded","Net_Paid"]].copy()
+by_team = by_team.sort_values(["Total Won","Team"], ascending=[False, True])
+disp = by_team[["Team","Owner","Total Won","Total Paid","Tolls","Net"]].copy()
 
-    # styling
-    def color_net(s):
-        return ["color: green;" if v > 0 else "color: red;" if v < 0 else "" for v in s]
+def color_net(s):
+    return ["color: green;" if v > 0 else "color: red;" if v < 0 else "" for v in s]
 
-    styled = (disp.style
-              .format({c: money for c in ["Total_Won","Total_Paid","Fee","Net_Awarded","Net_Paid"]})
-              .apply(color_net, subset=[net_col]))
+styled = (disp.style
+          .format({c: money for c in ["Total Won","Total Paid","Tolls","Net"]})
+          .apply(color_net, subset=["Net"]))
 
-    st.dataframe(styled, use_container_width=True, height=460, hide_index=True)
+st.dataframe(styled, use_container_width=True, hide_index=True, height=table_height(len(disp)))
+st.caption(f"Net = Total Won − {money(LEAGUE_FEE)} league fee − Tolls")
 
-    # season totals (raw)
-    raw_tot_won  = float(awarded["prize_amount"].sum())
-    raw_tot_paid = float(awarded.loc[awarded.get("paid", False), "prize_amount"].sum()) if "paid" in awarded.columns else 0.0
-    st.markdown("**Season Totals**")
-    st.write(f"- **Total Awarded:** {money(raw_tot_won)}")
-    st.write(f"- **Total Paid:** {money(raw_tot_paid)}")
+# season totals (raw)
+raw_tot_won  = float(awarded["prize_amount"].sum()) if not awarded.empty else 0.0
+raw_tot_paid = float(awarded.loc[awarded.get("paid", False), "prize_amount"].sum()) if ("paid" in awarded.columns and not awarded.empty) else 0.0
+st.markdown("**Season Totals**")
+st.write(f"- **Total Awarded:** {money(raw_tot_won)}")
+st.write(f"- **Total Paid:** {money(raw_tot_paid)}")
 
 st.markdown("---")
 
@@ -267,29 +373,26 @@ if "eliminated_week" not in teams.columns:
 else:
     alive = teams[teams["eliminated_week"].isna()].copy().sort_values("team_name")
     st.markdown(f"**Still Alive ({len(alive)})**")
-    st.dataframe(
-        alive[[c for c in ["team_name","owner"] if c in alive.columns]],
-        use_container_width=True, height=240, hide_index=True
-    )
+    alive_view = alive[[c for c in ["team_name","owner"] if c in alive.columns]].rename(columns={
+        "team_name":"Team","owner":"Owner"
+    })
+    st.dataframe(alive_view, use_container_width=True, hide_index=True, height=table_height(len(alive_view)))
 
     out = teams.dropna(subset=["eliminated_week"]).copy()
     if out.empty:
         st.caption("_No eliminations recorded yet._")
     else:
         out["eliminated_week"] = out["eliminated_week"].astype(int)
-        if not show_future:
-            out = out[out["eliminated_week"] <= MAX_WEEK]
-        elim_cols = ["eliminated_week","team_name"]
+        out = out[out["eliminated_week"] <= MAX_WEEK]
+        elim_cols = ["eliminated_week","team_name","owner"]
         for c in ["eliminated_score","eliminated_note"]:
             if c in out.columns: elim_cols.append(c)
+        out_sorted = out.sort_values(["eliminated_week","team_name"])[elim_cols].rename(columns={
+            "eliminated_week":"Week Eliminated",
+            "team_name":"Team",
+            "owner":"Owner",
+            "eliminated_score":"Score",
+            "eliminated_note":"Note"
+        })
         st.markdown("**Eliminations by Week**")
-        st.dataframe(
-            out.sort_values(["eliminated_week","team_name"])[elim_cols],
-            use_container_width=True, height=320, hide_index=True
-        )
-
-# ------------------ debug (optional) ------------------
-with st.expander("🔧 Debug (types)"):
-    st.write("Weeks dtypes:", dict(weeks.dtypes))
-    st.write("Challenges dtypes:", dict(chal.dtypes))
-    st.write("Teams dtypes:", dict(teams.dtypes))
+        st.dataframe(out_sorted, use_container_width=True, hide_index=True, height=table_height(len(out_sorted)))
