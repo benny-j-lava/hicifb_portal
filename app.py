@@ -311,7 +311,7 @@ if CSV_TOLLS and not tolls.empty and "tid" in tolls.columns and "tid" in teams.c
         f"{money(TOLL_BASE)}, {money(TOLL_BASE*2)}, {money(TOLL_BASE*4)}, … (cumulative per team)."
     )
 else:
-    st.info("Add a **Tolls** tab to your Google Sheet and publish its CSV as `CSV_TOLLS`.\nColumns: `week, initials, missing_starters` (or `players_missing`).")
+    st.info("No Talbot Tolls yet this season!")
 
 st.markdown("---")
 
